@@ -1,9 +1,11 @@
-use bytes::Bytes;
+use std::collections::hash_map::Entry;
+
 use thiserror::Error;
 use tracing::debug;
 
-use super::{ShouldTransmit, UnknownStream};
+use super::{ShouldTransmit, StreamHalf, StreamId, Streams, UnknownStream};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
+use crate::connection::Retransmits;
 use crate::{frame, TransportError, VarInt};
 
 #[derive(Debug, Default)]
@@ -68,49 +70,6 @@ impl Recv {
         Ok(new_bytes)
     }
 
-    pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> StreamReadResult<Chunk> {
-        if self.stopped {
-            return Err(ReadError::UnknownStream);
-        }
-
-        self.assembler.ensure_ordering(ordered)?;
-        match self.assembler.read(max_length, ordered) {
-            Some(chunk) => Ok(Some(chunk)),
-            None => self.read_blocked().map(|()| None),
-        }
-    }
-
-    pub(super) fn read_chunks(
-        &mut self,
-        chunks: &mut [Bytes],
-    ) -> Result<Option<ReadChunks>, ReadError> {
-        if self.stopped {
-            return Err(ReadError::UnknownStream);
-        }
-
-        let mut out = ReadChunks { bufs: 0, read: 0 };
-        if chunks.is_empty() {
-            return Ok(Some(out));
-        }
-
-        self.assembler.ensure_ordering(true)?;
-        while let Some(chunk) = self.assembler.read(usize::MAX, true) {
-            chunks[out.bufs] = chunk.bytes;
-            out.read += chunks[out.bufs].len();
-            out.bufs += 1;
-
-            if out.bufs >= chunks.len() {
-                return Ok(Some(out));
-            }
-        }
-
-        if out.bufs > 0 {
-            return Ok(Some(out));
-        }
-
-        self.read_blocked().map(|()| None)
-    }
-
     pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), UnknownStream> {
         if self.stopped {
             return Err(UnknownStream { _private: () });
@@ -121,24 +80,6 @@ impl Recv {
         // Issue flow control credit for unread data
         let read_credits = self.end - self.assembler.bytes_read();
         Ok((read_credits, ShouldTransmit(!self.is_finished())))
-    }
-
-    fn read_blocked(&mut self) -> Result<(), ReadError> {
-        match self.state {
-            RecvState::ResetRecvd { error_code, .. } => {
-                self.state = RecvState::Closed;
-                Err(ReadError::Reset(error_code))
-            }
-            RecvState::Closed => Err(ReadError::UnknownStream),
-            RecvState::Recv { size } => {
-                if size == Some(self.end) && self.assembler.bytes_read() == self.end {
-                    self.state = RecvState::Closed;
-                    Ok(())
-                } else {
-                    Err(ReadError::Blocked)
-                }
-            }
-        }
     }
 
     /// Returns the window that should be advertised in a `MAX_STREAM_DATA` frame
@@ -257,69 +198,177 @@ impl Recv {
     }
 }
 
-pub(crate) type ReadResult<T> = Result<Option<DidRead<T>>, ReadError>;
-
-/// Result of a `Streams::read` call in case the stream had not ended yet
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
-#[must_use = "A frame might need to be enqueued"]
-pub(crate) struct DidRead<T> {
-    pub result: T,
-    pub max_stream_data: ShouldTransmit,
-    pub max_data: ShouldTransmit,
+/// An iterator-like interface to read data from a receive stream
+pub struct Chunks<'a> {
+    id: StreamId,
+    streams: &'a mut Streams,
+    pending: &'a mut Retransmits,
+    recv: Option<Recv>,
+    ordered: bool,
+    read: u64,
+    fused: Option<ReadStatus>,
 }
 
-pub(super) type StreamReadResult<T> = Result<Option<T>, ReadError>;
+impl<'a> Chunks<'a> {
+    pub(crate) fn new(
+        id: StreamId,
+        streams: &'a mut Streams,
+        pending: &'a mut Retransmits,
+        ordered: bool,
+    ) -> Result<Self, ReadableError> {
+        let entry = match streams.recv.entry(id) {
+            Entry::Occupied(entry) => entry,
+            Entry::Vacant(_) => return Err(ReadableError::UnknownStream),
+        };
 
-pub(crate) trait BytesRead {
-    fn bytes_read(&self) -> u64;
-}
+        let mut rs = match entry.get().stopped {
+            true => return Err(ReadableError::UnknownStream),
+            false => entry.remove(),
+        };
 
-impl BytesRead for Chunk {
-    fn bytes_read(&self) -> u64 {
-        self.bytes.len() as u64
+        rs.assembler.ensure_ordering(ordered)?;
+        Ok(Self {
+            id,
+            recv: Some(rs),
+            streams,
+            pending,
+            ordered,
+            read: 0,
+            fused: None,
+        })
+    }
+
+    /// Read the next chunk from the stream
+    ///
+    /// Return the next chunk of data from the stream, if any are available. `max_length` may be
+    /// used to restrict the maximum size of the returned `Bytes` (but `usize::MAX` is supported,
+    /// too).
+    pub fn next(&mut self, max_length: usize) -> ReadResult {
+        if let Some(status) = &self.fused {
+            return ReadResult::from_status(*status);
+        }
+
+        let rs = self.recv.as_mut().unwrap();
+        let chunk = rs.assembler.read(max_length, self.ordered);
+        let status = match &chunk {
+            Some(chunk) => {
+                self.read += chunk.bytes.len() as u64;
+                ReadStatus::Readable
+            }
+            None => match rs.state {
+                RecvState::Recv { size } => {
+                    if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
+                        self.streams.stream_freed(self.id, StreamHalf::Recv);
+                        self.fused = Some(ReadStatus::Finished);
+                        ReadStatus::Finished
+                    } else {
+                        self.streams.recv.insert(self.id, self.recv.take().unwrap());
+                        self.fused = Some(ReadStatus::Blocked);
+                        ReadStatus::Blocked
+                    }
+                }
+                RecvState::ResetRecvd { error_code, .. } => {
+                    rs.state = RecvState::Closed;
+                    self.streams.stream_freed(self.id, StreamHalf::Recv);
+                    self.fused = Some(ReadStatus::Reset(error_code));
+                    ReadStatus::Reset(error_code)
+                }
+                RecvState::Closed => unreachable!(),
+            },
+        };
+
+        let mut should_transmit = ShouldTransmit(false);
+        if status != ReadStatus::Readable {
+            should_transmit = self.finalize();
+        }
+
+        ReadResult {
+            chunk,
+            status,
+            should_transmit,
+        }
+    }
+
+    /// Finish reading, letting the caller know if the connection has something to transmit
+    pub fn finalize(&mut self) -> ShouldTransmit {
+        let mut rs = match self.recv.take() {
+            Some(rs) => rs,
+            None => return ShouldTransmit(false),
+        };
+
+        let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
+        let max_data = self.streams.add_read_credits(self.read);
+        let max_dirty = self.streams.take_max_streams_dirty(self.id.dir());
+        self.pending
+            .post_read(self.id, max_data, max_stream_data, max_dirty);
+        max_data | max_stream_data | ShouldTransmit(max_dirty)
     }
 }
 
-pub(crate) struct ReadChunks {
-    pub bufs: usize,
-    pub read: usize,
-}
-
-impl BytesRead for ReadChunks {
-    fn bytes_read(&self) -> u64 {
-        self.read as u64
+impl<'a> Drop for Chunks<'a> {
+    fn drop(&mut self) {
+        let _ = self.finalize();
     }
 }
 
-/// Errors triggered when reading from a recv stream
-#[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum ReadError {
-    /// No more data is currently available on this stream.
-    ///
-    /// If more data on this stream is received from the peer, an `Event::StreamReadable` will be
-    /// generated for this stream, indicating that retrying the read might succeed.
-    #[error("blocked")]
-    Blocked,
-    /// The peer abandoned transmitting data on this stream.
-    ///
-    /// Carries an application-defined error code.
-    #[error("reset by peer: code {}", 0)]
-    Reset(VarInt),
-    /// The stream has not been opened or was already stopped, finished, or reset
-    #[error("unknown stream")]
-    UnknownStream,
+/// Errors that might occur when opening up a reader for a stream
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
+pub enum ReadableError {
     /// Attempted an ordered read following an unordered read
     ///
     /// Performing an unordered read allows discontinuities to arise in the receive buffer of a
     /// stream which cannot be recovered, making further ordered reads impossible.
     #[error("ordered read after unordered read")]
     IllegalOrderedRead,
+    /// The stream has not been opened or was already stopped, finished, or reset
+    #[error("unknown stream")]
+    UnknownStream,
 }
 
-impl From<IllegalOrderedRead> for ReadError {
+impl From<IllegalOrderedRead> for ReadableError {
     fn from(_: IllegalOrderedRead) -> Self {
-        ReadError::IllegalOrderedRead
+        ReadableError::IllegalOrderedRead
     }
+}
+
+/// Results of reading from a stream
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ReadResult {
+    /// The data read from the stream
+    pub chunk: Option<Chunk>,
+    /// The status of the stream after reading
+    pub status: ReadStatus,
+    /// Whether the connection is ready to transmit
+    pub should_transmit: ShouldTransmit,
+}
+
+impl ReadResult {
+    fn from_status(status: ReadStatus) -> Self {
+        Self {
+            chunk: None,
+            status,
+            should_transmit: ShouldTransmit(false),
+        }
+    }
+}
+
+/// Status of a receive stream
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub enum ReadStatus {
+    /// No more data is currently available on this stream
+    ///
+    /// If more data on this stream is received from the peer, an `Event::StreamReadable` will be
+    /// generated for this stream, indicating that retrying the read might succeed.
+    Blocked,
+    /// All data has been read from the stream
+    Finished,
+    /// More data can be read from the stream
+    Readable,
+    /// The peer abandoned transmitting data on this stream
+    ///
+    /// Carries an application-defined error code.
+    Reset(VarInt),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

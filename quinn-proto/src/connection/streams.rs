@@ -5,11 +5,10 @@ use std::{
     mem,
 };
 
-use bytes::{BufMut, Bytes};
+use bytes::BufMut;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-use super::assembler::Chunk;
 use super::spaces::Retransmits;
 use crate::{
     coding::BufMutExt,
@@ -20,9 +19,8 @@ use crate::{
 };
 
 mod recv;
-pub use recv::ReadError;
-use recv::{BytesRead, ReadChunks, Recv, StreamReadResult};
-pub(super) use recv::{DidRead, ReadResult};
+use recv::Recv;
+pub use recv::{Chunks, ReadResult, ReadStatus, ReadableError};
 
 mod send;
 pub use send::{FinishError, WriteError};
@@ -202,55 +200,13 @@ impl Streams {
         self.connection_blocked.clear();
     }
 
-    pub(crate) fn read(
-        &mut self,
+    pub(crate) fn read<'a>(
+        &'a mut self,
         id: StreamId,
-        max_length: usize,
         ordered: bool,
-    ) -> ReadResult<Chunk> {
-        self.try_read(id, |rs| rs.read(max_length, ordered))
-    }
-
-    pub(crate) fn read_chunks(
-        &mut self,
-        id: StreamId,
-        bufs: &mut [Bytes],
-    ) -> ReadResult<ReadChunks> {
-        self.try_read(id, |rs| rs.read_chunks(bufs))
-    }
-
-    fn try_read<F, O>(&mut self, id: StreamId, mut read: F) -> ReadResult<O>
-    where
-        F: FnMut(&mut Recv) -> StreamReadResult<O>,
-        O: BytesRead,
-    {
-        let mut entry = match self.recv.entry(id) {
-            hash_map::Entry::Vacant(_) => return Err(ReadError::UnknownStream),
-            hash_map::Entry::Occupied(e) => e,
-        };
-        let rs = entry.get_mut();
-        match read(rs) {
-            Ok(Some(out)) => {
-                let (_, max_stream_data) = rs.max_stream_data(self.stream_receive_window);
-                let max_data = self.add_read_credits(out.bytes_read());
-                Ok(Some(DidRead {
-                    result: out,
-                    max_stream_data,
-                    max_data,
-                }))
-            }
-            Ok(None) => {
-                entry.remove_entry();
-                self.stream_freed(id, StreamHalf::Recv);
-                Ok(None)
-            }
-            Err(e @ ReadError::Reset { .. }) => {
-                entry.remove_entry();
-                self.stream_freed(id, StreamHalf::Recv);
-                Err(e)
-            }
-            Err(e) => Err(e),
-        }
+        pending: &'a mut Retransmits,
+    ) -> Result<Chunks<'a>, ReadableError> {
+        Chunks::new(id, self, pending, ordered)
     }
 
     /// Queue `data` to be written for `stream`
@@ -1043,6 +999,19 @@ impl ShouldTransmit {
     }
 }
 
+impl std::ops::BitOr for ShouldTransmit {
+    type Output = ShouldTransmit;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        ShouldTransmit(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for ShouldTransmit {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// Error indicating that a stream has not been opened or has already been finished or reset
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("unknown stream")]
@@ -1060,6 +1029,7 @@ enum StreamHalf {
 mod tests {
     use super::*;
     use crate::TransportErrorCode;
+    use bytes::Bytes;
 
     fn make(side: Side) -> Streams {
         Streams::new(
@@ -1090,7 +1060,11 @@ mod tests {
         );
         assert_eq!(client.data_recvd, 2048);
         assert_eq!(client.local_max_data - initial_max, 0);
-        client.read(id, 1024, true).unwrap();
+
+        let mut pending = Retransmits::default();
+        let result = client.read(id, true, &mut pending).unwrap().next(1024);
+        assert!(result.chunk.is_some() && result.status == ReadStatus::Readable);
+
         assert_eq!(client.local_max_data - initial_max, 1024);
         assert_eq!(
             client
@@ -1191,10 +1165,15 @@ mod tests {
             }
         );
         assert!(client.stop(id).is_err());
-        assert_eq!(client.read(id, 0, true), Err(ReadError::UnknownStream));
+
+        let mut pending = Retransmits::default();
         assert_eq!(
-            client.read(id, usize::MAX, false),
-            Err(ReadError::UnknownStream)
+            client.read(id, true, &mut pending).err(),
+            Some(ReadableError::UnknownStream)
+        );
+        assert_eq!(
+            client.read(id, false, &mut pending).err(),
+            Some(ReadableError::UnknownStream)
         );
         assert_eq!(client.local_max_data - initial_max, 32);
         assert_eq!(
